@@ -1,12 +1,11 @@
 // ─────────────────────────────────────────────
 //  Sharma's Royal Salon — Backend Server
-//  Stack: Node.js + Express + MongoDB + Twilio
+//  Stack: Node.js + Express + MongoDB + Telegram
 // ─────────────────────────────────────────────
 
 const express  = require('express');
 const mongoose = require('mongoose');
 const cors     = require('cors');
-const twilio   = require('twilio');
 require('dotenv').config();
 
 const app = express();
@@ -26,50 +25,56 @@ const bookingSchema = new mongoose.Schema({
   name      : { type: String, required: true },
   phone     : { type: String, required: true },
   service   : { type: String, required: true },
-  date      : { type: String, required: true },   // "YYYY-MM-DD"
-  slot      : { type: String, required: true },   // "9:00 AM"
-  status    : { type: String, default: 'confirmed' }, // confirmed / cancelled
-  createdAt : { type: Date,   default: Date.now }
+  date      : { type: String, required: true },
+  slot      : { type: String, required: true },
+  status    : { type: String, default: 'confirmed' },
+  createdAt : { type: Date, default: Date.now }
 });
 
 const Booking = mongoose.model('Booking', bookingSchema);
 
-// ── TWILIO SETUP ──
-// Will only send WhatsApp if credentials exist in .env
-let twilioClient = null;
-if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-  twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-  console.log('✅ Twilio WhatsApp ready');
-} else {
-  console.log('⚠️  Twilio not configured — WhatsApp messages will be skipped');
-}
-
 // ─────────────────────────────────────────────
-//  HELPER: Send WhatsApp Message via Twilio
+//  TELEGRAM HELPER
+//  Sends a message to the salon owner's Telegram
+//  Uses simple fetch — no SDK needed at all
 // ─────────────────────────────────────────────
-async function sendWhatsApp(to, message) {
-  if (!twilioClient) return;   // Skip if Twilio not set up
+async function sendTelegram(message) {
+  const token  = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
 
-  // Format number: must be "whatsapp:+91XXXXXXXXXX"
-  const formatted = `whatsapp:+91${to.replace(/\D/g, '').slice(-10)}`;
+  // Skip silently if not configured
+  if (!token || !chatId) {
+    console.log('⚠️  Telegram not configured — skipping notification');
+    return;
+  }
 
   try {
-    await twilioClient.messages.create({
-      from : `whatsapp:${process.env.TWILIO_WHATSAPP_FROM}`,  // e.g. +14155238886 (sandbox) or your approved number
-      to   : formatted,
-      body : message
+    const url = `https://api.telegram.org/bot${token}/sendMessage`;
+    const res = await fetch(url, {
+      method  : 'POST',
+      headers : { 'Content-Type': 'application/json' },
+      body    : JSON.stringify({
+        chat_id    : chatId,
+        text       : message,
+        parse_mode : 'HTML'  // allows <b>bold</b> in messages
+      })
     });
-    console.log(`📲 WhatsApp sent to ${formatted}`);
+
+    const data = await res.json();
+    if (data.ok) {
+      console.log('📲 Telegram notification sent!');
+    } else {
+      console.error('Telegram error:', data.description);
+    }
   } catch (err) {
-    // Don't crash the app if WhatsApp fails
-    console.error('WhatsApp send failed:', err.message);
+    // Don't crash the app if Telegram fails
+    console.error('Telegram send failed:', err.message);
   }
 }
 
 // ─────────────────────────────────────────────
 //  ROUTE 1: GET /api/slots/:date
 //  Returns all booked slots for a given date
-//  Frontend uses this to grey out taken slots
 // ─────────────────────────────────────────────
 app.get('/api/slots/:date', async (req, res) => {
   try {
@@ -88,14 +93,14 @@ app.get('/api/slots/:date', async (req, res) => {
 
 // ─────────────────────────────────────────────
 //  ROUTE 2: POST /api/book
-//  Creates a new booking, saves to MongoDB,
-//  sends WhatsApp to owner + customer
+//  Creates booking, saves to MongoDB,
+//  sends Telegram notification to owner
 // ─────────────────────────────────────────────
 app.post('/api/book', async (req, res) => {
   try {
     const { name, phone, service, date, slot } = req.body;
 
-    // ── Basic validation ──
+    // ── Validation ──
     if (!name || !phone || !service || !date || !slot) {
       return res.status(400).json({ error: 'All fields are required.' });
     }
@@ -103,51 +108,37 @@ app.post('/api/book', async (req, res) => {
       return res.status(400).json({ error: 'Enter a valid 10-digit mobile number.' });
     }
 
-    // ── Check if slot is already booked ──
+    // ── Check slot not already taken ──
     const existing = await Booking.findOne({ date, slot, status: 'confirmed' });
     if (existing) {
       return res.status(409).json({ error: 'This slot just got booked. Please pick another time.' });
     }
 
-    // ── Generate unique Booking ID ──
+    // ── Generate Booking ID ──
     const bookingId = 'SRS-' + Date.now().toString(36).toUpperCase().slice(-6);
 
-    // ── Save to database ──
+    // ── Save to MongoDB ──
     const booking = new Booking({ bookingId, name, phone, service, date, slot });
     await booking.save();
 
-    // ── WhatsApp to OWNER ──
-    const ownerMsg =
-      `🔔 *New Booking Alert!*\n\n` +
-      `📋 ID: ${bookingId}\n` +
+    // ── Send Telegram to Owner ──
+    const message =
+      `🔔 <b>New Booking Alert!</b>\n\n` +
+      `📋 ID: <b>${bookingId}</b>\n` +
       `👤 Name: ${name}\n` +
-      `📞 Phone: ${phone}\n` +
+      `📞 Phone: <b>${phone}</b>\n` +
       `✂️ Service: ${service}\n` +
       `📅 Date: ${date}\n` +
-      `⏰ Slot: ${slot}\n\n` +
-      `Reply DONE when complete.`;
+      `⏰ Slot: <b>${slot}</b>\n\n` +
+      `<i>Sharma's Royal Salon — Siwan</i>`;
 
-    await sendWhatsApp(process.env.OWNER_PHONE, ownerMsg);
-
-    // ── WhatsApp to CUSTOMER ──
-    const customerMsg =
-      `✅ *Booking Confirmed!*\n` +
-      `*Sharma's Royal Salon, Siwan*\n\n` +
-      `📋 Booking ID: *${bookingId}*\n` +
-      `✂️ Service: ${service}\n` +
-      `📅 Date: ${date}\n` +
-      `⏰ Time: ${slot}\n\n` +
-      `📍 Near Main Chowk, Siwan, Bihar\n` +
-      `📞 +91 ${process.env.OWNER_PHONE}\n\n` +
-      `Please arrive 5 min early. Show this message at the salon. 🙏`;
-
-    await sendWhatsApp(phone, customerMsg);
+    await sendTelegram(message);
 
     // ── Respond to frontend ──
     res.json({
       success   : true,
       bookingId,
-      message   : 'Booking confirmed! WhatsApp sent to your number.'
+      message   : 'Booking confirmed!'
     });
 
   } catch (err) {
@@ -158,28 +149,21 @@ app.post('/api/book', async (req, res) => {
 
 // ─────────────────────────────────────────────
 //  ROUTE 3: GET /api/queue
-//  Returns number of people waiting right now
-//  (bookings from now to next 2 hours today)
+//  Live queue count for today
 // ─────────────────────────────────────────────
 app.get('/api/queue', async (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
-    const count = await Booking.countDocuments({
-      date   : today,
-      status : 'confirmed'
-    });
-    // Each service ~20 min on average
-    const waitMins = count * 20;
-    res.json({ waiting: count, estimatedWaitMins: waitMins });
+    const count = await Booking.countDocuments({ date: today, status: 'confirmed' });
+    res.json({ waiting: count, estimatedWaitMins: count * 20 });
   } catch (err) {
     res.status(500).json({ waiting: 0, estimatedWaitMins: 0 });
   }
 });
 
 // ─────────────────────────────────────────────
-//  ROUTE 4: GET /api/bookings
-//  Simple admin view — all bookings for today
-//  (You can add password protection later)
+//  ROUTE 4: GET /api/bookings?date=YYYY-MM-DD
+//  See all bookings for a date (owner use)
 // ─────────────────────────────────────────────
 app.get('/api/bookings', async (req, res) => {
   try {
@@ -193,7 +177,6 @@ app.get('/api/bookings', async (req, res) => {
 
 // ─────────────────────────────────────────────
 //  ROUTE 5: DELETE /api/cancel/:bookingId
-//  Cancel a booking (slot opens back up)
 // ─────────────────────────────────────────────
 app.delete('/api/cancel/:bookingId', async (req, res) => {
   try {
@@ -203,20 +186,21 @@ app.delete('/api/cancel/:bookingId', async (req, res) => {
       { new: true }
     );
     if (!booking) return res.status(404).json({ error: 'Booking not found.' });
+
+    await sendTelegram(`❌ <b>Booking Cancelled</b>\nID: ${req.params.bookingId}`);
     res.json({ success: true, message: 'Booking cancelled.' });
   } catch (err) {
     res.status(500).json({ error: 'Could not cancel booking.' });
   }
 });
 
-// ── HEALTH CHECK (Render needs this) ──
+// ── HEALTH CHECK ──
 app.get('/', (req, res) => {
   res.json({ status: 'ok', app: "Sharma's Royal Salon API", time: new Date() });
 });
 
-// ── START SERVER ──
+// ── START ──
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`\n🚀 Server running on port ${PORT}`);
-  console.log(`   Local: http://localhost:${PORT}\n`);
 });
